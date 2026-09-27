@@ -30,7 +30,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  __cmuxTest__,
+  isCmuxAvailable,
+  shellEscape,
+} from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +60,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -1207,12 +1211,27 @@ describe("subagent discovery", () => {
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    withTempDir((dir) => {
+      const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+      const webSearchDir = join(dir, "extensions", "web-search");
+      mkdirSync(webSearchDir, { recursive: true });
+      writeFileSync(join(webSearchDir, "index.ts"), "export default function () {}\n");
+      process.env.PI_CODING_AGENT_DIR = dir;
+      try {
+        assert.equal(testApi.getToolExtensionPath("read"), undefined);
+        assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+        assert.equal(
+          testApi.getToolExtensionPath("web_search"),
+          join(webSearchDir, "index.ts"),
+        );
+        assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+        // Spawning tools are registered by this extension itself.
+        assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+      } finally {
+        if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1230,6 +1249,25 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
+    });
+  });
+
+  it("resolves and propagates the child Pi CLI from the launcher environment", () => {
+    assert.deepEqual(testApi.resolvePiLauncher({ PI_SUBAGENT_CLI: "pi-sp" }), {
+      cli: "pi-sp",
+      envAssignment: "PI_SUBAGENT_CLI='pi-sp'",
+    });
+    assert.deepEqual(testApi.resolvePiLauncher({ PI_SUBAGENT_CLI: "  /custom/pi  " }), {
+      cli: "/custom/pi",
+      envAssignment: "PI_SUBAGENT_CLI='/custom/pi'",
+    });
+    assert.deepEqual(testApi.resolvePiLauncher({}), {
+      cli: "pi",
+      envAssignment: "PI_SUBAGENT_CLI='pi'",
+    });
+    assert.deepEqual(testApi.resolvePiLauncher({ PI_SUBAGENT_CLI: "   " }), {
+      cli: "pi",
+      envAssignment: "PI_SUBAGENT_CLI='pi'",
     });
   });
 
@@ -1741,7 +1779,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("cmux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -2652,7 +2690,154 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("cmux.ts", () => {
+  describe("cmux output parsing", () => {
+    it("extracts surface and pane refs from creation output", () => {
+      assert.deepEqual(
+        __cmuxTest__.parseCreatedSurface("Created surface:12 in pane:4", "new-surface"),
+        { surface: "surface:12", paneRef: "pane:4" },
+      );
+    });
+
+    it("rejects creation output without a surface ref", () => {
+      assert.throws(
+        () => __cmuxTest__.parseCreatedSurface("created pane:4", "new-split"),
+        /Unexpected cmux new-split output/,
+      );
+    });
+
+    it("recognizes a pane by exact ref rather than a substring collision", () => {
+      const tree = "pane:20\n  surface:8\npane:3\n  surface:9";
+      assert.equal(__cmuxTest__.treeContainsPane(tree, "pane:2"), false);
+      assert.equal(__cmuxTest__.treeContainsPane(tree, "pane:20"), true);
+    });
+
+    it("splits cmux control sequences so no send payload contains one", () => {
+      assert.deepEqual(
+        __cmuxTest__.splitControlSequences(String.raw`echo 'a\nb\rc\td\q'`),
+        ["echo 'a\\", "nb\\", "rc\\", String.raw`td\q'`],
+      );
+    });
+
+    it("extracts focused and caller refs from identify JSON", () => {
+      const snapshot = __cmuxTest__.parseIdentifySnapshot(JSON.stringify({
+        focused: {
+          window_ref: "window:1",
+          workspace_ref: "workspace:9",
+          surface_ref: "surface:7",
+          pane_ref: "pane:3",
+        },
+        caller: {
+          window_ref: "window:1",
+          workspace_ref: "workspace:2",
+          surface_ref: "surface:2",
+          pane_ref: "pane:1",
+        },
+      }));
+      assert.deepEqual(snapshot, {
+        focused: {
+          windowRef: "window:1",
+          workspaceRef: "workspace:9",
+          surfaceRef: "surface:7",
+          paneRef: "pane:3",
+        },
+        caller: {
+          windowRef: "window:1",
+          workspaceRef: "workspace:2",
+          surfaceRef: "surface:2",
+          paneRef: "pane:1",
+        },
+      });
+    });
+
+    it("treats malformed identify output as an empty snapshot", () => {
+      assert.deepEqual(__cmuxTest__.parseIdentifySnapshot("not json"), {
+        focused: null,
+        caller: null,
+      });
+    });
+
+    it("restores a late focus steal into the background workspace", () => {
+      const desired = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:9",
+        paneRef: "pane:9",
+        surfaceRef: "surface:9",
+      };
+      const stolen = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:2",
+        paneRef: "pane:2",
+        surfaceRef: "surface:2",
+      };
+
+      assert.deepEqual(
+        __cmuxTest__.advanceFocusGuard(desired, stolen, "workspace:2"),
+        { desired, restoreTo: desired },
+      );
+    });
+
+    it("tracks deliberate user navigation outside the background workspace", () => {
+      const original = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:9",
+        paneRef: "pane:9",
+        surfaceRef: "surface:9",
+      };
+      const userDestination = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:10",
+        paneRef: "pane:10",
+        surfaceRef: "surface:10",
+      };
+
+      assert.deepEqual(
+        __cmuxTest__.advanceFocusGuard(original, userDestination, "workspace:2"),
+        { desired: userDestination },
+      );
+    });
+
+    it("does not undo deliberate navigation after correcting one focus steal", () => {
+      const original = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:9",
+        paneRef: "pane:9",
+        surfaceRef: "surface:9",
+      };
+      const operationDestination = {
+        windowRef: "window:1",
+        workspaceRef: "workspace:2",
+        paneRef: "pane:2",
+        surfaceRef: "surface:2",
+      };
+
+      assert.deepEqual(
+        __cmuxTest__.advanceFocusGuard(
+          original,
+          operationDestination,
+          "workspace:2",
+          new Set(["surface:2"]),
+          new Set(["pane:2"]),
+          false,
+        ),
+        { desired: operationDestination },
+      );
+    });
+  });
+
+  describe("availability", () => {
+    it("requires a caller surface as well as a cmux socket", () => {
+      const saved = process.env.CMUX_SURFACE_ID;
+      delete process.env.CMUX_SURFACE_ID;
+      try {
+        assert.equal(isCmuxAvailable(), false);
+      } finally {
+        if (saved === undefined) delete process.env.CMUX_SURFACE_ID;
+        else process.env.CMUX_SURFACE_ID = saved;
+      }
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

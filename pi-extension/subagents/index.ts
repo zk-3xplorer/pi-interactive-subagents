@@ -24,7 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./cmux.ts";
 
 import {
   countSessionEntryLines,
@@ -508,10 +508,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require cmux. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "cmux not available" },
   };
 }
 
@@ -1008,7 +1008,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via cmux: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1119,6 +1119,18 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+/** Resolve the Pi launcher selected by the process that started this session. */
+function resolvePiLauncher(env: NodeJS.ProcessEnv = process.env): {
+  cli: string;
+  envAssignment: string;
+} {
+  const cli = env.PI_SUBAGENT_CLI?.trim() || "pi";
+  return {
+    cli,
+    envAssignment: `PI_SUBAGENT_CLI=${shellEscape(cli)}`,
+  };
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1141,6 +1153,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolvePiLauncher,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1314,8 +1327,9 @@ async function launchSubagent(
 
   // ── Pi CLI path ──
 
-  // Build pi command
-  const parts: string[] = ["pi"];
+  // Build Pi command using the launcher identity inherited from the parent session.
+  const piLauncher = resolvePiLauncher();
+  const parts: string[] = [shellEscape(piLauncher.cli)];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1357,7 +1371,7 @@ async function launchSubagent(
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
+  const envParts: string[] = [piLauncher.envAssignment];
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -2152,8 +2166,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
+        // Build Pi resume command using the same launcher as the parent session.
+        const piLauncher = resolvePiLauncher();
+        const parts = [shellEscape(piLauncher.cli), "--session", shellEscape(sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -2188,7 +2203,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
+        const resumeEnvParts: string[] = [piLauncher.envAssignment];
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);

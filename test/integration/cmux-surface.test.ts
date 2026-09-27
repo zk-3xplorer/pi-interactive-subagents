@@ -1,12 +1,13 @@
 /**
- * Integration tests for the tmux surface layer.
+ * Integration tests for the cmux surface layer.
  *
- * These tests exercise real tmux operations: creating panes,
+ * These tests exercise real cmux operations: creating surfaces,
  * sending commands, reading screen output, and closing panes.
  * No LLM calls — fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run inside cmux:
+ *   cmux .
+ *   npm run test:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -18,7 +19,14 @@ import {
   createTrackedSurface,
   createTrackedSurfaceSplit,
   focusSurface,
+  getCallerSurface,
   getFocusedSurface,
+  getFocusedWorkspace,
+  createFocusedWorkspace,
+  selectWorkspace,
+  closeWorkspace,
+  getSurfacePane,
+  getSurfaceTitle,
   waitForFocusedSurface,
   untrackSurface,
   sendCommand,
@@ -38,12 +46,12 @@ const backends = getAvailableBackends();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  cmux is not available — skipping cmux-surface integration tests");
+  console.log("   Run inside cmux to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+  describe(`cmux-surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
 
     before(() => {
@@ -54,9 +62,59 @@ for (const backend of backends) {
       cleanupTestEnv(env);
     });
 
+    it("keeps the user's other workspace selected while creating background subagent surfaces", async () => {
+      const originalWorkspace = getFocusedWorkspace();
+      const userWorkspace = createFocusedWorkspace(`focus-other-${uniqueId()}`);
+
+      try {
+        await sleep(500);
+        assert.equal(getFocusedWorkspace(), userWorkspace);
+
+        const childA = createTrackedSurface(env, "background-child-a");
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedWorkspace(), userWorkspace);
+
+        const childB = createTrackedSurface(env, "background-child-b");
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedWorkspace(), userWorkspace);
+
+        closeSurface(childA);
+        untrackSurface(env, childA);
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedWorkspace(), userWorkspace);
+
+        closeSurface(childB);
+        untrackSurface(env, childB);
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedWorkspace(), userWorkspace);
+      } finally {
+        if (originalWorkspace) selectWorkspace(originalWorkspace);
+        closeWorkspace(userWorkspace);
+      }
+    });
+
+    it("respects deliberate navigation to a third workspace during focus stabilization", async () => {
+      const originalWorkspace = getFocusedWorkspace();
+      const initialUserWorkspace = createFocusedWorkspace(`focus-initial-${uniqueId()}`);
+      let userDestination: string | null = null;
+
+      try {
+        await sleep(250);
+        createTrackedSurface(env, "background-before-user-move");
+        userDestination = createFocusedWorkspace(`focus-destination-${uniqueId()}`);
+
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedWorkspace(), userDestination);
+      } finally {
+        if (originalWorkspace) selectWorkspace(originalWorkspace);
+        closeWorkspace(initialUserWorkspace);
+        if (userDestination) closeWorkspace(userDestination);
+      }
+    });
+
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
+      const anchor = getCallerSurface();
+      assert.ok(anchor, "cmux identify must resolve the caller surface");
 
       focusSurface(anchor);
       await waitForFocusedSurface(anchor, 10_000);
@@ -68,6 +126,13 @@ for (const backend of backends) {
       const childB = createTrackedSurface(env, "focus-child-b");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(), anchor);
+      assert.equal(
+        getSurfacePane(childB),
+        getSurfacePane(childA),
+        "later subagents should open as tabs in the first subagent pane",
+      );
+      assert.equal(getSurfaceTitle(childA), "focus-child-a");
+      assert.equal(getSurfaceTitle(childB), "focus-child-b");
 
       const markerA = uniqueId();
       const markerB = uniqueId();
@@ -117,6 +182,21 @@ for (const backend of backends) {
       assert.ok(
         screen.includes("$HOME"),
         `Expected literal $HOME in output. Got:\n${screen}`,
+      );
+    });
+
+    it("preserves literal cmux control sequences in commands", async () => {
+      const surface = createTrackedSurface(env, "control-sequence-test");
+      await sleep(1000);
+
+      const marker = uniqueId();
+      sendCommand(surface, `printf '%s' 'CTRL_${marker}_\\n_\\r_\\t_END'`);
+      await sleep(1500);
+
+      const screen = readScreen(surface, 50);
+      assert.ok(
+        screen.includes(`CTRL_${marker}_\\n_\\r_\\t_END`),
+        `Expected literal control sequences. Got:\n${screen}`,
       );
     });
 
@@ -180,7 +260,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
+      const filePath = `/tmp/pi-cmux-test-${marker}.txt`;
 
       sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 

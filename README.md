@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in cmux surfaces. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**cmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The first sub-agent opens in a right split from the parent pi surface; later sub-agents open as named tabs in that same cmux pane. Creation does not steal keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,19 +17,30 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
-
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
 ```bash
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 ```
 
+### Custom Pi launchers
+
+Subagents default to the `pi` executable. A wrapper can identify the command that
+children and resumed sessions should use through `PI_SUBAGENT_CLI`:
+
+```bash
+#!/usr/bin/env bash
+export PI_SUBAGENT_CLI="pi-sp"
+exec pi "$@"
+```
+
+The launcher name must be available on `PATH` in new cmux surfaces.
+
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated cmux surface (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -178,10 +189,13 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [cmux](https://cmux.dev)
+
+Open the project in cmux, then run pi:
 
 ```bash
-tmux new -A -s pi 'pi'
+cmux .
+pi
 ```
 
 ## Acknowledgements

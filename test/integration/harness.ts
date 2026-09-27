@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether cmux is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in cmux surfaces
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -32,9 +32,9 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+} from "../../pi-extension/subagents/cmux.ts";
 
-// Re-export tmux primitives for tests
+// Re-export cmux primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -76,24 +76,107 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Detect whether cmux is available in the current environment.
+ * Returns ["cmux"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  return isMuxAvailable() ? ["cmux"] : [];
 }
 
 export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+  const identify = JSON.parse(
+    execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8" }),
+  );
+  const caller = identify?.caller;
+  const args = ["focus-panel", "--panel", surface];
+  if (typeof caller?.workspace_ref === "string") {
+    args.push("--workspace", caller.workspace_ref);
+  }
+  if (typeof caller?.window_ref === "string") {
+    args.push("--window", caller.window_ref);
+  }
+  execFileSync("cmux", args, { encoding: "utf8" });
+}
+
+export function getCallerSurface(): string | null {
+  try {
+    const identify = JSON.parse(execFileSync("cmux", ["identify"], { encoding: "utf8" }));
+    return typeof identify?.caller?.surface_ref === "string"
+      ? identify.caller.surface_ref
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export function getFocusedSurface(): string | null {
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
+    const identify = JSON.parse(execFileSync("cmux", ["identify"], { encoding: "utf8" }));
+    return typeof identify?.focused?.surface_ref === "string"
+      ? identify.focused.surface_ref
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getFocusedWorkspace(): string | null {
+  try {
+    const identify = JSON.parse(execFileSync("cmux", ["identify"], { encoding: "utf8" }));
+    return typeof identify?.focused?.workspace_ref === "string"
+      ? identify.focused.workspace_ref
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createFocusedWorkspace(name: string): string {
+  const output = execFileSync(
+    "cmux",
+    ["workspace", "create", "--name", name, "--focus", "true"],
+    { encoding: "utf8" },
+  );
+  const workspace = output.match(/workspace:\d+/)?.[0];
+  if (!workspace) throw new Error(`Unexpected cmux new-workspace output: ${output}`);
+  return workspace;
+}
+
+export function selectWorkspace(workspace: string): void {
+  execFileSync("cmux", ["workspace", "select", "--workspace", workspace], { encoding: "utf8" });
+}
+
+export function closeWorkspace(workspace: string): void {
+  execFileSync("cmux", ["workspace", "close", "--workspace", workspace], { encoding: "utf8" });
+}
+
+export function getSurfacePane(surface: string): string | null {
+  try {
+    const identify = JSON.parse(
+      execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8" }),
+    );
+    return typeof identify?.caller?.pane_ref === "string" ? identify.caller.pane_ref : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getSurfaceTitle(surface: string): string | null {
+  try {
+    const tree = JSON.parse(
+      execFileSync("cmux", ["--json", "tree", "--workspace", process.env.CMUX_WORKSPACE_ID!], {
+        encoding: "utf8",
+      }),
+    );
+    for (const window of tree.windows ?? []) {
+      for (const workspace of window.workspaces ?? []) {
+        for (const pane of workspace.panes ?? []) {
+          const found = (pane.surfaces ?? []).find((candidate: any) => candidate.ref === surface);
+          if (found) return typeof found.title === "string" ? found.title : null;
+        }
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -110,7 +193,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused cmux surface ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -120,7 +203,7 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Panes created during the test (cleaned up automatically) */
+  /** Surfaces created during the test (cleaned up automatically) */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
@@ -200,7 +283,7 @@ export function untrackSurface(env: TestEnv, surface: string): void {
  * Returns immediately — the pi process runs asynchronously in the surface.
  *
  * The command ends with a sentinel so we can detect when pi exits:
- *   `pi ...; echo '__TEST_DONE_'$?'__'`
+ *   `$PI_SUBAGENT_CLI ...; echo '__TEST_DONE_'$?'__'`
  */
 export function startPi(
   surface: string,
@@ -210,6 +293,7 @@ export function startPi(
 ): void {
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
+  const piCli = process.env.PI_SUBAGENT_CLI?.trim() || "pi";
 
   // Force pi to load the working-tree extension (not an installed pi-package
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
@@ -217,7 +301,7 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
-    `pi`,
+    shellEscape(piCli),
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
